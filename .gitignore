@@ -229,3 +229,4 @@ frontend/dist/
 .env
 .codesight/
 venv/
+.vite/
