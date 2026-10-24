@@ -228,3 +228,4 @@ frontend/dist/
 *.db
 .env
 .codesight/
+venv/
