@@ -1,151 +1,152 @@
-# IOC Watchlist Manager
+# IOC Watchlist
 
-A small full-stack app for analysts to maintain a watchlist of Indicators of Compromise (IOCs): IPv4 addresses, domains, URLs and file hashes (MD5 / SHA-1 / SHA-256).
+A small app to keep a list of IOCs (indicators of compromise) like IPs, domains, URLs and file hashes (md5, sha1, sha256).
 
-The type is detected automatically, invalid values are rejected, and **the same indicator can never be stored twice**, even when it is written differently (defanged vs. normal, different case, surrounding whitespace, trailing dots or slashes, URL fragments).
+You paste a value, it figures out the type by itself, rejects bad values, and won't let you save the same IOC twice. Even if it's written differently (like `hxxps://evil[.]com` and `https://evil.com`), it counts as the same one.
 
-## Tech stack
+## Tech used
 
-| Layer    | Choice                                  |
-|----------|-----------------------------------------|
-| Frontend | React 18 + TypeScript (Vite)            |
-| Backend  | Python 3.12, FastAPI, SQLAlchemy 2      |
-| Database | SQLite (relational, many-to-many tags)  |
-| Tests    | pytest (56 tests)                       |
+- Frontend: React + TypeScript (Vite)
+- Backend: Python, FastAPI, SQLAlchemy
+- Database: SQLite
+- Tests: pytest
 
-## Architecture and design decisions
+## Folder layout
 
 ```
-frontend/   React + TS UI (form, list, filters, delete)
+frontend/          react app (form, list, filters, delete)
 backend/
-  app/normalize.py   type detection + canonicalisation (pure functions, no I/O)
-  app/models.py      IOC, Tag, ioc_tags (many-to-many join table)
-  app/schemas.py     request/response validation (Pydantic)
-  app/main.py        REST endpoints
-  tests/             unit tests for normalisation, API tests for everything else
+  app/normalize.py   detects type and cleans the value
+  app/models.py      db tables (ioc, tag, and the join table)
+  app/schemas.py     request/response validation
+  app/main.py        the api endpoints
+  tests/             tests for normalize and the api
 ```
 
-- **Canonical value + UNIQUE constraint.** Every value is normalised to a canonical form which is stored in `iocs.value` (UNIQUE). The original input is kept in `raw_value`. The API checks for an existing entry first (to return a helpful 409), and the DB constraint is the real guarantee: if two concurrent requests race, the loser hits `IntegrityError` and still gets the same clean 409.
-- **Normalisation is a pure module** (`normalize.py`), so the tricky logic is unit-tested in isolation from HTTP and the DB.
-- **Many-to-many tags** via `ioc_tags` join table with `ON DELETE CASCADE` (SQLite foreign keys are switched on explicitly, as they are off by default). Tags are lowercased and de-duplicated. Orphaned tags are removed when the last IOC using them is deleted, so the tag filter never offers dead options.
-- **One deployable.** After `npm run build`, FastAPI serves the built React app from `frontend/dist`, so production is one process on one port with no CORS. In development Vite proxies `/api` to FastAPI.
-- **Structured errors.** All errors return `{"detail": {"code", "message", ...}}`; a duplicate also returns the `existing` entry.
+## How duplicates are handled
 
-### Domain rules (canonical form)
+Every value is cleaned up first (lowercase, remove defang stuff, trailing slashes etc). The cleaned value is saved in `iocs.value` which is UNIQUE. The original text you typed is saved in `raw_value`.
 
-| Type | Rules |
-|------|-------|
-| md5 / sha1 / sha256 | Hex only, 32 / 40 / 64 chars, lowercased |
-| ipv4 | Valid dotted quad; leading zeros rejected (ambiguous: some tools read `010` as octal) |
-| domain | Lowercased; IDN converted to punycode; trailing `.` and `/` removed; >= 2 labels; alphabetic TLD (so `1.2.3` and `evil.123` are rejected) |
-| url | Schemes `http`, `https`, `ftp`; host lowercased, trailing dot removed; default port removed (`:443` on https); **fragment dropped**; trailing slashes on the path removed; **path and query keep their case** because servers treat them as case-sensitive |
+The api checks if it already exists and returns a 409 with the existing entry. The unique constraint in the db is the backup in case two requests come at the same time.
 
-Defang patterns reversed before validation: `hxxp(s)`, `fxp`, `[.]`, `(.)`, `{.}`, `[dot]`, `[:]`, `[://]`.
+## What gets cleaned
 
-Examples that are treated as the same indicator:
-`hxxps://Evil[.]example[.]com/login/`, `https://evil.example.com/login#top`, `https://evil.example.com:443/login`.
+- **hashes**: only hex, 32/40/64 chars, lowercased
+- **ipv4**: must be a proper ip. Leading zeros are rejected (`010` can be read as octal)
+- **domain**: lowercased, trailing `.` and `/` removed, needs at least 2 parts and a TLD with letters
+- **url**: http, https, ftp only. Host is lowercased, default port removed, `#fragment` dropped, trailing slash removed. Path and query keep their case because servers care about it
 
-### Assumptions and trade-offs
+Defang stuff that is reversed: `hxxp`, `hxxps`, `fxp`, `[.]`, `(.)`, `{.}`, `[dot]`, `[:]`, `[://]`.
 
-- `http://x.com` and `https://x.com` are **different** indicators (different scheme can mean different infrastructure). Same for `evil.com` (domain) vs `http://evil.com` (url).
-- `www.evil.com` and `evil.com` are different domains; no subdomain collapsing.
-- Query parameter order is not normalised, since order can matter to a server.
-- A bare `evil.com/path` (no scheme) is rejected rather than guessed.
-- IPv6 is out of scope (not in the supported type list). `http://[::1]/` is rejected.
-- Defanged input is accepted but the stored/displayed value is the **refanged** form. Analysts should treat it as live; the UI never renders it as a link. React escapes all values.
-- No authentication (per the brief).
+These all count as the same IOC:
+`hxxps://Evil[.]example[.]com/login/`, `https://evil.example.com/login#top`, `https://evil.example.com:443/login`
 
-## Run locally (development)
+## Tags
 
-Requires Python 3.12+ and Node 20+.
+An IOC can have many tags and a tag can be on many IOCs (join table `ioc_tags`). Tags are lowercased and duplicates are removed. When the last IOC using a tag is deleted, the tag is deleted too so the filter doesn't show dead tags.
+
+## Assumptions
+
+- `http://x.com` and `https://x.com` are different IOCs. Same for `evil.com` and `http://evil.com`.
+- `www.evil.com` and `evil.com` are different domains.
+- Query param order is not changed.
+- `evil.com/path` without a scheme is rejected, it doesn't guess.
+- No IPv6.
+- Defanged input is saved in the normal (refanged) form, so be careful with it. The UI never makes it a clickable link.
+- No login/auth.
+
+## Run locally
+
+Needs Python 3.12+ and Node 20+.
 
 ```bash
-# Terminal 1: backend  (http://localhost:8000, docs at /docs)
+# terminal 1 - backend (http://localhost:8000, docs at /docs)
 cd backend
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m venv venv
+venv\Scripts\activate          # on mac/linux: source venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
 
-# Terminal 2: frontend (http://localhost:5173, proxies /api to :8000)
+# terminal 2 - frontend (http://localhost:5173)
 cd frontend
 npm install
 npm run dev
 ```
 
-The SQLite file `backend/iocs.db` and its tables are created automatically on first start. No migration step is needed for this schema.
+The `backend/iocs.db` file and tables get created automatically on first start. No migration needed.
 
 ## Run tests
 
 ```bash
-cd backend && source .venv/bin/activate
+cd backend
 pytest -q
 ```
 
-Frontend type-check and production build: `cd frontend && npm run build`.
+To check the frontend build: `cd frontend && npm run build`
 
-## Deployment (no Docker)
-
-Requires Python 3.12+ and Node 20+ on the target machine.
+## Deploy (no docker)
 
 ```bash
-# 1. Build the frontend once
+# build frontend once
 cd frontend
 npm ci
-npm run build            # outputs frontend/dist
+npm run build
 
-# 2. Install backend deps and start the server (serves API + built UI on one port)
+# start backend, it serves the api and the built ui on one port
 cd ../backend
-python -m venv .venv && source .venv/bin/activate
+python -m venv venv
+venv\Scripts\activate          # on mac/linux: source venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 # open http://localhost:8000
 ```
 
-- **Environment variables** (both optional)
-  - `DATABASE_URL`: SQLAlchemy URL. Default `sqlite:///./iocs.db` (file created in the directory you start the server from). For an absolute path use `sqlite:////var/data/iocs.db`.
-  - `STATIC_DIR`: folder containing the built frontend. Default `frontend/dist` relative to the repo.
-- **Database setup / migration:** tables are created automatically at startup (`create_all`), so there is no separate migration step. To reset, stop the server and delete the `.db` file.
-- **Seeding:** none required. To add sample data:
-  ```bash
-  curl -XPOST localhost:8000/api/iocs -H 'content-type: application/json' \
-    -d '{"value":"hxxps://evil[.]example[.]com/login","tags":["phishing"]}'
-  ```
-- **Production notes:** run behind a process manager (systemd, supervisor) and a reverse proxy such as nginx for TLS. Back up the SQLite file. Switching to Postgres only needs a different `DATABASE_URL` plus the `psycopg[binary]` package.
-- Health check: `GET /api/health`.
+Optional env variables:
+- `DATABASE_URL` - default is `sqlite:///./iocs.db`
+- `STATIC_DIR` - where the built frontend is, default is `frontend/dist`
+
+To reset the data, stop the server and delete the `.db` file. No seed data needed, but you can add one with:
+
+```bash
+curl -XPOST localhost:8000/api/iocs -H 'content-type: application/json' \
+  -d '{"value":"hxxps://evil[.]example[.]com/login","tags":["phishing"]}'
+```
+
+For real use, run it behind something like systemd and nginx, and back up the sqlite file.
 
 ## API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/iocs` | Create. Body: `{"value": str, "note"?: str, "tags"?: [str]}`. `201` with the IOC; `422` invalid value; `409` duplicate |
-| GET | `/api/iocs?tag=&type=` | List, newest first. Both filters optional and combinable. `422` for an unknown type |
-| DELETE | `/api/iocs/{id}` | `204`, or `404` |
-| GET | `/api/tags` | All tag names (used by the UI filter) |
-| GET | `/api/health` | Liveness |
+| Method | Path | What it does |
+|--------|------|--------------|
+| POST | `/api/iocs` | add one. Body: `{"value": "...", "note": "...", "tags": ["..."]}`. 201 ok, 422 invalid, 409 duplicate |
+| GET | `/api/iocs?tag=&type=` | list, newest first. Both filters optional |
+| DELETE | `/api/iocs/{id}` | delete. 204 or 404 |
+| GET | `/api/tags` | all tag names |
+| GET | `/api/health` | health check |
 
-Interactive docs: `http://localhost:8000/docs`.
+Docs page: `http://localhost:8000/docs`
 
-Duplicate response (`409`):
+Duplicate (409) looks like this:
 ```json
 {"detail": {"code": "duplicate",
             "message": "This indicator already exists as entry #1 (url: https://evil.example.com/login).",
-            "existing": {"id": 1, "type": "url", "value": "https://evil.example.com/login", "...": "..."}}}
+            "existing": {"id": 1, "type": "url", "value": "https://evil.example.com/login"}}}
 ```
 
 ## Known limitations
 
-- No pagination: the list endpoint returns everything.
-- No edit/update endpoint, only create / list / delete.
-- No frontend tests (the logic that matters is on the backend and tested there).
-- `created_at` loses its timezone marker when read back from SQLite (stored as UTC).
-- Schema is created with `create_all`, not versioned migrations.
-- Not tested at scale; SQLite is single-writer.
+- No pagination, list returns everything
+- No edit, only add / list / delete
+- No frontend tests
+- `created_at` loses its timezone when read back from sqlite (it is stored in UTC)
+- Tables made with `create_all`, no real migrations
+- Not tested with lots of data
 
-## What I would improve with more time
+## Would do with more time
 
-- Alembic migrations and a Postgres option in compose.
-- Pagination, search, and sorting; bulk import (paste a list or CSV) with a per-line report.
-- Edit tags and note on existing IOCs.
-- IPv6 and CIDR support, email addresses, and CVE IDs.
-- Use a public-suffix list for stricter domain validation.
-- Frontend tests (Vitest + Testing Library) and a CI pipeline (lint, tests, build).
+- Alembic migrations and Postgres
+- Pagination, search, sorting
+- Bulk import (paste list or csv)
+- Edit tags and notes
+- IPv6, CIDR, emails, CVE ids
+- Frontend tests and CI
